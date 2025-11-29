@@ -6,22 +6,26 @@ from uuid import uuid4
 from sqlalchemy import Index, UniqueConstraint
 
 from agno.db.base import BaseDb, SessionType
+from agno.db.migrations.manager import MigrationManager
 from agno.db.mysql.schemas import get_table_schema_definition
 from agno.db.mysql.utils import (
     apply_sorting,
     bulk_upsert_metrics,
     calculate_date_metrics,
     create_schema,
+    deserialize_cultural_knowledge_from_db,
     fetch_all_sessions_data,
     get_dates_to_calculate_metrics_for,
     is_table_available,
     is_valid_table,
+    serialize_cultural_knowledge_for_db,
 )
+from agno.db.schemas.culture import CulturalKnowledge
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
 from agno.db.schemas.memory import UserMemory
 from agno.session import AgentSession, Session, TeamSession, WorkflowSession
-from agno.utils.log import log_debug, log_error, log_info
+from agno.utils.log import log_debug, log_error, log_info, log_warning
 from agno.utils.string import generate_id
 
 try:
@@ -42,10 +46,12 @@ class MySQLDb(BaseDb):
         db_schema: Optional[str] = None,
         db_url: Optional[str] = None,
         session_table: Optional[str] = None,
+        culture_table: Optional[str] = None,
         memory_table: Optional[str] = None,
         metrics_table: Optional[str] = None,
         eval_table: Optional[str] = None,
         knowledge_table: Optional[str] = None,
+        versions_table: Optional[str] = None,
         id: Optional[str] = None,
     ):
         """
@@ -61,10 +67,12 @@ class MySQLDb(BaseDb):
             db_engine (Optional[Engine]): The SQLAlchemy database engine to use.
             db_schema (Optional[str]): The database schema to use.
             session_table (Optional[str]): Name of the table to store Agent, Team and Workflow sessions.
+            culture_table (Optional[str]): Name of the table to store cultural knowledge.
             memory_table (Optional[str]): Name of the table to store memories.
             metrics_table (Optional[str]): Name of the table to store metrics.
             eval_table (Optional[str]): Name of the table to store evaluation runs data.
             knowledge_table (Optional[str]): Name of the table to store knowledge content.
+            versions_table (Optional[str]): Name of the table to store schema versions.
             id (Optional[str]): ID of the database.
 
         Raises:
@@ -80,10 +88,12 @@ class MySQLDb(BaseDb):
         super().__init__(
             id=id,
             session_table=session_table,
+            culture_table=culture_table,
             memory_table=memory_table,
             metrics_table=metrics_table,
             eval_table=eval_table,
             knowledge_table=knowledge_table,
+            versions_table=versions_table,
         )
 
         _engine: Optional[Engine] = db_engine
@@ -95,28 +105,37 @@ class MySQLDb(BaseDb):
         self.db_url: Optional[str] = db_url
         self.db_engine: Engine = _engine
         self.db_schema: str = db_schema if db_schema is not None else "ai"
-        self.metadata: MetaData = MetaData()
+        self.metadata: MetaData = MetaData(schema=self.db_schema)
 
         # Initialize database session
         self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
 
     # -- DB methods --
-    def _create_table(self, table_name: str, table_type: str, db_schema: str) -> Table:
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a table with the given name exists in the MySQL database.
+
+        Args:
+            table_name: Name of the table to check
+
+        Returns:
+            bool: True if the table exists in the database, False otherwise
+        """
+        with self.Session() as sess:
+            return is_table_available(session=sess, table_name=table_name, db_schema=self.db_schema)
+
+    def _create_table(self, table_name: str, table_type: str) -> Table:
         """
         Create a table with the appropriate schema based on the table type.
 
         Args:
             table_name (str): Name of the table to create
             table_type (str): Type of table (used to get schema definition)
-            db_schema (str): Database schema name
 
         Returns:
             Table: SQLAlchemy Table object
         """
         try:
             table_schema = get_table_schema_definition(table_type)
-
-            log_debug(f"Creating table {db_schema}.{table_name} with schema: {table_schema}")
 
             columns: List[Column] = []
             indexes: List[str] = []
@@ -139,8 +158,7 @@ class MySQLDb(BaseDb):
                 columns.append(Column(*column_args, **column_kwargs))  # type: ignore
 
             # Create the table object
-            table_metadata = MetaData(schema=db_schema)
-            table = Table(table_name, table_metadata, *columns, schema=db_schema)
+            table = Table(table_name, self.metadata, *columns, schema=self.db_schema)
 
             # Add multi-column unique constraints with table-specific names
             for constraint in schema_unique_constraints:
@@ -154,16 +172,20 @@ class MySQLDb(BaseDb):
                 table.append_constraint(Index(idx_name, idx_col))
 
             with self.Session() as sess, sess.begin():
-                create_schema(session=sess, db_schema=db_schema)
+                create_schema(session=sess, db_schema=self.db_schema)
 
             # Create table
-            table.create(self.db_engine, checkfirst=True)
+            table_created = False
+            if not self.table_exists(table_name):
+                table.create(self.db_engine, checkfirst=True)
+                log_debug(f"Successfully created table '{table_name}'")
+                table_created = True
+            else:
+                log_debug(f"Table {self.db_schema}.{table_name} already exists, skipping creation")
 
             # Create indexes
             for idx in table.indexes:
                 try:
-                    log_debug(f"Creating index: {idx.name}")
-
                     # Check if index already exists
                     with self.Session() as sess:
                         exists_query = text(
@@ -172,32 +194,56 @@ class MySQLDb(BaseDb):
                         )
                         exists = (
                             sess.execute(
-                                exists_query, {"schema": db_schema, "table_name": table_name, "index_name": idx.name}
+                                exists_query,
+                                {"schema": self.db_schema, "table_name": table_name, "index_name": idx.name},
                             ).scalar()
                             is not None
                         )
                         if exists:
-                            log_debug(f"Index {idx.name} already exists in {db_schema}.{table_name}, skipping creation")
+                            log_debug(
+                                f"Index {idx.name} already exists in {self.db_schema}.{table_name}, skipping creation"
+                            )
                             continue
 
                     idx.create(self.db_engine)
 
+                    log_debug(f"Created index: {idx.name} for table {self.db_schema}.{table_name}")
                 except Exception as e:
                     log_error(f"Error creating index {idx.name}: {e}")
 
-            log_info(f"Successfully created table {db_schema}.{table_name}")
+            # Store the schema version for the created table
+            if table_name != self.versions_table_name and table_created:
+                latest_schema_version = MigrationManager(self).latest_schema_version
+                self.upsert_schema_version(table_name=table_name, version=latest_schema_version.public)
+                log_info(
+                    f"Successfully stored version {latest_schema_version.public} in database for table {table_name}"
+                )
+
             return table
 
         except Exception as e:
-            log_error(f"Could not create table {db_schema}.{table_name}: {e}")
+            log_error(f"Could not create table {self.db_schema}.{table_name}: {e}")
             raise
+
+    def _create_all_tables(self):
+        """Create all tables for the database."""
+        tables_to_create = [
+            (self.session_table_name, "sessions"),
+            (self.memory_table_name, "memories"),
+            (self.metrics_table_name, "metrics"),
+            (self.eval_table_name, "evals"),
+            (self.knowledge_table_name, "knowledge"),
+            (self.versions_table_name, "versions"),
+        ]
+
+        for table_name, table_type in tables_to_create:
+            self._get_or_create_table(table_name=table_name, table_type=table_type, create_table_if_not_found=True)
 
     def _get_table(self, table_type: str, create_table_if_not_found: Optional[bool] = False) -> Optional[Table]:
         if table_type == "sessions":
             self.session_table = self._get_or_create_table(
                 table_name=self.session_table_name,
                 table_type="sessions",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.session_table
@@ -206,7 +252,6 @@ class MySQLDb(BaseDb):
             self.memory_table = self._get_or_create_table(
                 table_name=self.memory_table_name,
                 table_type="memories",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.memory_table
@@ -215,7 +260,6 @@ class MySQLDb(BaseDb):
             self.metrics_table = self._get_or_create_table(
                 table_name=self.metrics_table_name,
                 table_type="metrics",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.metrics_table
@@ -224,7 +268,6 @@ class MySQLDb(BaseDb):
             self.eval_table = self._get_or_create_table(
                 table_name=self.eval_table_name,
                 table_type="evals",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.eval_table
@@ -233,15 +276,30 @@ class MySQLDb(BaseDb):
             self.knowledge_table = self._get_or_create_table(
                 table_name=self.knowledge_table_name,
                 table_type="knowledge",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.knowledge_table
 
+        if table_type == "culture":
+            self.culture_table = self._get_or_create_table(
+                table_name=self.culture_table_name,
+                table_type="culture",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.culture_table
+
+        if table_type == "versions":
+            self.versions_table = self._get_or_create_table(
+                table_name=self.versions_table_name,
+                table_type="versions",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.versions_table
+
         raise ValueError(f"Unknown table type: {table_type}")
 
     def _get_or_create_table(
-        self, table_name: str, table_type: str, db_schema: str, create_table_if_not_found: Optional[bool] = False
+        self, table_name: str, table_type: str, create_table_if_not_found: Optional[bool] = False
     ) -> Optional[Table]:
         """
         Check if the table exists and is valid, else create it.
@@ -249,37 +307,70 @@ class MySQLDb(BaseDb):
         Args:
             table_name (str): Name of the table to get or create
             table_type (str): Type of table (used to get schema definition)
-            db_schema (str): Database schema name
 
         Returns:
             Table: SQLAlchemy Table object representing the schema.
         """
 
         with self.Session() as sess, sess.begin():
-            table_is_available = is_table_available(session=sess, table_name=table_name, db_schema=db_schema)
+            table_is_available = is_table_available(session=sess, table_name=table_name, db_schema=self.db_schema)
 
         if not table_is_available:
             if not create_table_if_not_found:
                 return None
 
-            return self._create_table(table_name=table_name, table_type=table_type, db_schema=db_schema)
+            created_table = self._create_table(table_name=table_name, table_type=table_type)
+
+            return created_table
 
         if not is_valid_table(
             db_engine=self.db_engine,
             table_name=table_name,
             table_type=table_type,
-            db_schema=db_schema,
+            db_schema=self.db_schema,
         ):
-            raise ValueError(f"Table {db_schema}.{table_name} has an invalid schema")
+            raise ValueError(f"Table {self.db_schema}.{table_name} has an invalid schema")
 
         try:
-            table = Table(table_name, self.metadata, schema=db_schema, autoload_with=self.db_engine)
-            log_debug(f"Loaded existing table {db_schema}.{table_name}")
+            table = Table(table_name, self.metadata, schema=self.db_schema, autoload_with=self.db_engine)
             return table
 
         except Exception as e:
-            log_error(f"Error loading existing table {db_schema}.{table_name}: {e}")
+            log_error(f"Error loading existing table {self.db_schema}.{table_name}: {e}")
             raise
+
+    def get_latest_schema_version(self, table_name: str) -> str:
+        """Get the latest version of the database schema."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        with self.Session() as sess:
+            # Latest version for the given table
+            stmt = select(table).where(table.c.table_name == table_name).order_by(table.c.version.desc()).limit(1)  # type: ignore
+            result = sess.execute(stmt).fetchone()
+            if result is None:
+                return "2.0.0"
+            version_dict = dict(result._mapping)
+            return version_dict.get("version") or "2.0.0"
+
+    def upsert_schema_version(self, table_name: str, version: str) -> None:
+        """Upsert the schema version into the database."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        if table is None:
+            return
+        current_datetime = datetime.now().isoformat()
+        with self.Session() as sess, sess.begin():
+            stmt = mysql.insert(table).values(  # type: ignore
+                table_name=table_name,
+                version=version,
+                created_at=current_datetime,  # Store as ISO format string
+                updated_at=current_datetime,
+            )
+            # Update version if table_name already exists
+            stmt = stmt.on_duplicate_key_update(
+                version=version,
+                created_at=current_datetime,
+                updated_at=current_datetime,
+            )
+            sess.execute(stmt)
 
     # -- Session methods --
     def delete_session(self, session_id: str) -> bool:
@@ -372,9 +463,6 @@ class MySQLDb(BaseDb):
 
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == user_id)
-                if session_type is not None:
-                    session_type_value = session_type.value if isinstance(session_type, SessionType) else session_type
-                    stmt = stmt.where(table.c.session_type == session_type_value)
                 result = sess.execute(stmt).fetchone()
                 if result is None:
                     return None
@@ -417,7 +505,7 @@ class MySQLDb(BaseDb):
         Args:
             session_type (Optional[SessionType]): The type of sessions to get.
             user_id (Optional[str]): The ID of the user to filter by.
-            entity_id (Optional[str]): The ID of the agent / workflow to filter by.
+            component_id (Optional[str]): The ID of the agent / workflow to filter by.
             start_timestamp (Optional[int]): The start timestamp to filter by.
             end_timestamp (Optional[int]): The end timestamp to filter by.
             session_name (Optional[str]): The name of the session to filter by.
@@ -426,7 +514,6 @@ class MySQLDb(BaseDb):
             sort_by (Optional[str]): The field to sort by. Defaults to None.
             sort_order (Optional[str]): The sort order. Defaults to None.
             deserialize (Optional[bool]): Whether to serialize the sessions. Defaults to True.
-            create_table_if_not_found (Optional[bool]): Whether to create the table if it doesn't exist.
 
         Returns:
             Union[List[Session], Tuple[List[Dict], int]]:
@@ -706,7 +793,7 @@ class MySQLDb(BaseDb):
             return None
 
     def upsert_sessions(
-        self, sessions: List[Session], deserialize: Optional[bool] = True
+        self, sessions: List[Session], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
     ) -> List[Union[Session, Dict[str, Any]]]:
         """
         Bulk upsert multiple sessions for improved performance on large datasets.
@@ -714,6 +801,7 @@ class MySQLDb(BaseDb):
         Args:
             sessions (List[Session]): List of sessions to upsert.
             deserialize (Optional[bool]): Whether to deserialize the sessions. Defaults to True.
+            preserve_updated_at (bool): If True, preserve the updated_at from the session object.
 
         Returns:
             List[Union[Session, Dict[str, Any]]]: List of upserted sessions.
@@ -758,6 +846,8 @@ class MySQLDb(BaseDb):
                     agent_data = []
                     for session in agent_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         agent_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -770,7 +860,7 @@ class MySQLDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -784,7 +874,7 @@ class MySQLDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, agent_data)
 
@@ -808,6 +898,8 @@ class MySQLDb(BaseDb):
                     team_data = []
                     for session in team_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         team_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -820,7 +912,7 @@ class MySQLDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -834,7 +926,7 @@ class MySQLDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, team_data)
 
@@ -858,6 +950,8 @@ class MySQLDb(BaseDb):
                     workflow_data = []
                     for session in workflow_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         workflow_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -870,7 +964,7 @@ class MySQLDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -884,7 +978,7 @@ class MySQLDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, workflow_data)
 
@@ -1151,7 +1245,7 @@ class MySQLDb(BaseDb):
             log_error(f"Exception clearing user memories: {e}")
 
     def get_user_memory_stats(
-        self, limit: Optional[int] = None, page: Optional[int] = None
+        self, limit: Optional[int] = None, page: Optional[int] = None, user_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], int]:
         """Get user memories stats.
 
@@ -1180,16 +1274,19 @@ class MySQLDb(BaseDb):
                 return [], 0
 
             with self.Session() as sess, sess.begin():
-                stmt = (
-                    select(
-                        table.c.user_id,
-                        func.count(table.c.memory_id).label("total_memories"),
-                        func.max(table.c.updated_at).label("last_memory_updated_at"),
-                    )
-                    .where(table.c.user_id.is_not(None))
-                    .group_by(table.c.user_id)
-                    .order_by(func.max(table.c.updated_at).desc())
+                stmt = select(
+                    table.c.user_id,
+                    func.count(table.c.memory_id).label("total_memories"),
+                    func.max(table.c.updated_at).label("last_memory_updated_at"),
                 )
+
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
+                else:
+                    stmt = stmt.where(table.c.user_id.is_not(None))
+
+                stmt = stmt.group_by(table.c.user_id)
+                stmt = stmt.order_by(func.max(table.c.updated_at).desc())
 
                 count_stmt = select(func.count()).select_from(stmt.alias())
                 total_count = sess.execute(count_stmt).scalar()
@@ -1243,6 +1340,8 @@ class MySQLDb(BaseDb):
                 if memory.memory_id is None:
                     memory.memory_id = str(uuid4())
 
+                current_time = int(time.time())
+
                 stmt = mysql.insert(table).values(
                     memory_id=memory.memory_id,
                     memory=memory.memory,
@@ -1251,7 +1350,9 @@ class MySQLDb(BaseDb):
                     agent_id=memory.agent_id,
                     team_id=memory.team_id,
                     topics=memory.topics,
-                    updated_at=int(time.time()),
+                    feedback=memory.feedback,
+                    created_at=memory.created_at,
+                    updated_at=memory.created_at,
                 )
                 stmt = stmt.on_duplicate_key_update(
                     memory=memory.memory,
@@ -1259,7 +1360,10 @@ class MySQLDb(BaseDb):
                     input=memory.input,
                     agent_id=memory.agent_id,
                     team_id=memory.team_id,
-                    updated_at=int(time.time()),
+                    feedback=memory.feedback,
+                    updated_at=current_time,
+                    # Preserve created_at on update - don't overwrite existing value
+                    created_at=table.c.created_at,
                 )
                 sess.execute(stmt)
 
@@ -1281,7 +1385,7 @@ class MySQLDb(BaseDb):
             return None
 
     def upsert_memories(
-        self, memories: List[UserMemory], deserialize: Optional[bool] = True
+        self, memories: List[UserMemory], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
     ) -> List[Union[UserMemory, Dict[str, Any]]]:
         """
         Bulk upsert multiple user memories for improved performance on large datasets.
@@ -1313,9 +1417,14 @@ class MySQLDb(BaseDb):
 
             # Prepare bulk data
             bulk_data = []
+            current_time = int(time.time())
+
             for memory in memories:
                 if memory.memory_id is None:
                     memory.memory_id = str(uuid4())
+
+                # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                updated_at = memory.updated_at if preserve_updated_at else current_time
 
                 bulk_data.append(
                     {
@@ -1326,7 +1435,9 @@ class MySQLDb(BaseDb):
                         "agent_id": memory.agent_id,
                         "team_id": memory.team_id,
                         "topics": memory.topics,
-                        "updated_at": int(time.time()),
+                        "feedback": memory.feedback,
+                        "created_at": memory.created_at,
+                        "updated_at": updated_at,
                     }
                 )
 
@@ -1341,7 +1452,10 @@ class MySQLDb(BaseDb):
                     input=stmt.inserted.input,
                     agent_id=stmt.inserted.agent_id,
                     team_id=stmt.inserted.team_id,
-                    updated_at=int(time.time()),
+                    feedback=stmt.inserted.feedback,
+                    updated_at=stmt.inserted.updated_at,
+                    # Preserve created_at on update
+                    created_at=table.c.created_at,
                 )
                 sess.execute(stmt, bulk_data)
 
@@ -1654,9 +1768,9 @@ class MySQLDb(BaseDb):
                     if page is not None:
                         stmt = stmt.offset((page - 1) * limit)
 
-                    result = sess.execute(stmt).fetchall()
-                    if not result:
-                        return [], 0
+                result = sess.execute(stmt).fetchall()
+                if not result:
+                    return [], 0
 
                 return [KnowledgeRow.model_validate(record._mapping) for record in result], total_count
 
@@ -1985,6 +2099,222 @@ class MySQLDb(BaseDb):
         except Exception as e:
             log_error(f"Error upserting eval run name {eval_run_id}: {e}")
             return None
+
+    # -- Culture methods --
+
+    def clear_cultural_knowledge(self) -> None:
+        """Delete all cultural knowledge from the database.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                sess.execute(table.delete())
+
+        except Exception as e:
+            log_warning(f"Exception deleting all cultural knowledge: {e}")
+            raise e
+
+    def delete_cultural_knowledge(self, id: str) -> None:
+        """Delete a cultural knowledge entry from the database.
+
+        Args:
+            id (str): The ID of the cultural knowledge to delete.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                delete_stmt = table.delete().where(table.c.id == id)
+                result = sess.execute(delete_stmt)
+
+                success = result.rowcount > 0
+                if success:
+                    log_debug(f"Successfully deleted cultural knowledge id: {id}")
+                else:
+                    log_debug(f"No cultural knowledge found with id: {id}")
+
+        except Exception as e:
+            log_error(f"Error deleting cultural knowledge: {e}")
+            raise e
+
+    def get_cultural_knowledge(
+        self, id: str, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Get a cultural knowledge entry from the database.
+
+        Args:
+            id (str): The ID of the cultural knowledge to get.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Optional[Union[CulturalKnowledge, Dict[str, Any]]]: The cultural knowledge entry, or None if it doesn't exist.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return None
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table).where(table.c.id == id)
+                result = sess.execute(stmt).fetchone()
+                if result is None:
+                    return None
+
+                db_row = dict(result._mapping)
+                if not db_row or not deserialize:
+                    return db_row
+
+            return deserialize_cultural_knowledge_from_db(db_row)
+
+        except Exception as e:
+            log_error(f"Exception reading from cultural knowledge table: {e}")
+            raise e
+
+    def get_all_cultural_knowledge(
+        self,
+        name: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+        """Get all cultural knowledge from the database as CulturalKnowledge objects.
+
+        Args:
+            name (Optional[str]): The name of the cultural knowledge to filter by.
+            agent_id (Optional[str]): The ID of the agent to filter by.
+            team_id (Optional[str]): The ID of the team to filter by.
+            limit (Optional[int]): The maximum number of cultural knowledge entries to return.
+            page (Optional[int]): The page number.
+            sort_by (Optional[str]): The column to sort by.
+            sort_order (Optional[str]): The order to sort by.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+                - When deserialize=True: List of CulturalKnowledge objects
+                - When deserialize=False: List of CulturalKnowledge dictionaries and total count
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return [] if deserialize else ([], 0)
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table)
+
+                # Filtering
+                if name is not None:
+                    stmt = stmt.where(table.c.name == name)
+                if agent_id is not None:
+                    stmt = stmt.where(table.c.agent_id == agent_id)
+                if team_id is not None:
+                    stmt = stmt.where(table.c.team_id == team_id)
+
+                # Get total count after applying filtering
+                count_stmt = select(func.count()).select_from(stmt.alias())
+                total_count = sess.execute(count_stmt).scalar()
+
+                # Sorting
+                stmt = apply_sorting(stmt, table, sort_by, sort_order)
+                # Paginating
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+                    if page is not None:
+                        stmt = stmt.offset((page - 1) * limit)
+
+                result = sess.execute(stmt).fetchall()
+                if not result:
+                    return [] if deserialize else ([], 0)
+
+                db_rows = [dict(record._mapping) for record in result]
+
+                if not deserialize:
+                    return db_rows, total_count
+
+            return [deserialize_cultural_knowledge_from_db(row) for row in db_rows]
+
+        except Exception as e:
+            log_error(f"Error reading from cultural knowledge table: {e}")
+            raise e
+
+    def upsert_cultural_knowledge(
+        self, cultural_knowledge: CulturalKnowledge, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Upsert a cultural knowledge entry into the database.
+
+        Args:
+            cultural_knowledge (CulturalKnowledge): The cultural knowledge to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Optional[CulturalKnowledge]: The upserted cultural knowledge entry.
+
+        Raises:
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
+            if table is None:
+                return None
+
+            if cultural_knowledge.id is None:
+                cultural_knowledge.id = str(uuid4())
+
+            # Serialize content, categories, and notes into a JSON dict for DB storage
+            content_dict = serialize_cultural_knowledge_for_db(cultural_knowledge)
+
+            with self.Session() as sess, sess.begin():
+                stmt = mysql.insert(table).values(
+                    id=cultural_knowledge.id,
+                    name=cultural_knowledge.name,
+                    summary=cultural_knowledge.summary,
+                    content=content_dict if content_dict else None,
+                    metadata=cultural_knowledge.metadata,
+                    input=cultural_knowledge.input,
+                    created_at=cultural_knowledge.created_at,
+                    updated_at=int(time.time()),
+                    agent_id=cultural_knowledge.agent_id,
+                    team_id=cultural_knowledge.team_id,
+                )
+                stmt = stmt.on_duplicate_key_update(
+                    name=cultural_knowledge.name,
+                    summary=cultural_knowledge.summary,
+                    content=content_dict if content_dict else None,
+                    metadata=cultural_knowledge.metadata,
+                    input=cultural_knowledge.input,
+                    updated_at=int(time.time()),
+                    agent_id=cultural_knowledge.agent_id,
+                    team_id=cultural_knowledge.team_id,
+                )
+                sess.execute(stmt)
+
+            # Fetch the inserted/updated row
+            return self.get_cultural_knowledge(id=cultural_knowledge.id, deserialize=deserialize)
+
+        except Exception as e:
+            log_error(f"Error upserting cultural knowledge: {e}")
+            raise e
 
     # -- Migrations --
 

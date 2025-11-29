@@ -7,12 +7,14 @@ from typing import Any, Dict, Iterator, List, Optional, Type, Union
 import httpx
 from pydantic import BaseModel
 
+from agno.exceptions import ModelProviderError
 from agno.models.base import Model
 from agno.models.message import Message
 from agno.models.metrics import Metrics
 from agno.models.response import ModelResponse
 from agno.run.agent import RunOutput
-from agno.utils.log import log_debug, log_error, log_warning
+from agno.utils.http import get_default_async_client, get_default_sync_client
+from agno.utils.log import log_debug, log_warning
 
 try:
     from cerebras.cloud.sdk import AsyncCerebras as AsyncCerebrasClient
@@ -51,6 +53,7 @@ class Cerebras(Model):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+    strict_output: bool = True  # When True, guarantees schema adherence for structured outputs. When False, attempts to follow schema as a guide but may occasionally deviate
     extra_headers: Optional[Any] = None
     extra_query: Optional[Any] = None
     extra_body: Optional[Any] = None
@@ -63,7 +66,7 @@ class Cerebras(Model):
     max_retries: Optional[int] = None
     default_headers: Optional[Any] = None
     default_query: Optional[Any] = None
-    http_client: Optional[httpx.Client] = None
+    http_client: Optional[Union[httpx.Client, httpx.AsyncClient]] = None
     client_params: Optional[Dict[str, Any]] = None
 
     # Cerebras clients
@@ -75,7 +78,11 @@ class Cerebras(Model):
         if not self.api_key:
             self.api_key = getenv("CEREBRAS_API_KEY")
             if not self.api_key:
-                log_error("CEREBRAS_API_KEY not set. Please set the CEREBRAS_API_KEY environment variable.")
+                raise ModelProviderError(
+                    message="CEREBRAS_API_KEY not set. Please set the CEREBRAS_API_KEY environment variable.",
+                    model_name=self.name,
+                    model_id=self.id,
+                )
 
         # Define base client params
         base_params = {
@@ -102,12 +109,15 @@ class Cerebras(Model):
         Returns:
             CerebrasClient: An instance of the Cerebras client.
         """
-        if self.client:
+        if self.client and not self.client.is_closed():
             return self.client
 
         client_params: Dict[str, Any] = self._get_client_params()
         if self.http_client is not None:
             client_params["http_client"] = self.http_client
+        else:
+            # Use global sync client when no custom http_client is provided
+            client_params["http_client"] = get_default_sync_client()
         self.client = CerebrasClient(**client_params)
         return self.client
 
@@ -118,17 +128,15 @@ class Cerebras(Model):
         Returns:
             AsyncCerebras: An instance of the asynchronous Cerebras client.
         """
-        if self.async_client:
+        if self.async_client and not self.async_client.is_closed():
             return self.async_client
 
         client_params: Dict[str, Any] = self._get_client_params()
-        if self.http_client:
+        if self.http_client and isinstance(self.http_client, httpx.AsyncClient):
             client_params["http_client"] = self.http_client
         else:
-            # Create a new async HTTP client with custom limits
-            client_params["http_client"] = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100)
-            )
+            # Use global async client when no custom http_client is provided
+            client_params["http_client"] = get_default_async_client()
         self.async_client = AsyncCerebrasClient(**client_params)
         return self.async_client
 
@@ -186,10 +194,10 @@ class Cerebras(Model):
                 and response_format.get("type") == "json_schema"
                 and isinstance(response_format.get("json_schema"), dict)
             ):
-                # Ensure json_schema has strict=True as required by Cerebras API
+                # Ensure json_schema has strict parameter set
                 schema = response_format["json_schema"]
                 if isinstance(schema.get("schema"), dict) and "strict" not in schema:
-                    schema["strict"] = True
+                    schema["strict"] = self.strict_output
 
                 request_params["response_format"] = response_format
 
@@ -209,6 +217,7 @@ class Cerebras(Model):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
+        compress_tool_results: bool = False,
     ) -> ModelResponse:
         """
         Send a chat completion request to the Cerebras API.
@@ -225,7 +234,7 @@ class Cerebras(Model):
         assistant_message.metrics.start_timer()
         provider_response = self.get_client().chat.completions.create(
             model=self.id,
-            messages=[self._format_message(m) for m in messages],  # type: ignore
+            messages=[self._format_message(m, compress_tool_results) for m in messages],  # type: ignore
             **self.get_request_params(response_format=response_format, tools=tools),
         )
         assistant_message.metrics.stop_timer()
@@ -242,6 +251,7 @@ class Cerebras(Model):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
+        compress_tool_results: bool = False,
     ) -> ModelResponse:
         """
         Sends an asynchronous chat completion request to the Cerebras API.
@@ -258,7 +268,7 @@ class Cerebras(Model):
         assistant_message.metrics.start_timer()
         provider_response = await self.get_async_client().chat.completions.create(
             model=self.id,
-            messages=[self._format_message(m) for m in messages],  # type: ignore
+            messages=[self._format_message(m, compress_tool_results) for m in messages],  # type: ignore
             **self.get_request_params(response_format=response_format, tools=tools),
         )
         assistant_message.metrics.stop_timer()
@@ -275,6 +285,7 @@ class Cerebras(Model):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
+        compress_tool_results: bool = False,
     ) -> Iterator[ModelResponse]:
         """
         Send a streaming chat completion request to the Cerebras API.
@@ -292,7 +303,7 @@ class Cerebras(Model):
 
         for chunk in self.get_client().chat.completions.create(
             model=self.id,
-            messages=[self._format_message(m) for m in messages],  # type: ignore
+            messages=[self._format_message(m, compress_tool_results) for m in messages],  # type: ignore
             stream=True,
             **self.get_request_params(response_format=response_format, tools=tools),
         ):
@@ -308,6 +319,7 @@ class Cerebras(Model):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
+        compress_tool_results: bool = False,
     ) -> AsyncIterator[ModelResponse]:
         """
         Sends an asynchronous streaming chat completion request to the Cerebras API.
@@ -325,7 +337,7 @@ class Cerebras(Model):
 
         async_stream = await self.get_async_client().chat.completions.create(
             model=self.id,
-            messages=[self._format_message(m) for m in messages],  # type: ignore
+            messages=[self._format_message(m, compress_tool_results) for m in messages],  # type: ignore
             stream=True,
             **self.get_request_params(response_format=response_format, tools=tools),
         )
@@ -335,20 +347,27 @@ class Cerebras(Model):
 
         assistant_message.metrics.stop_timer()
 
-    def _format_message(self, message: Message) -> Dict[str, Any]:
+    def _format_message(self, message: Message, compress_tool_results: bool = False) -> Dict[str, Any]:
         """
         Format a message into the format expected by the Cerebras API.
 
         Args:
             message (Message): The message to format.
+            compress_tool_results: Whether to compress tool results.
 
         Returns:
             Dict[str, Any]: The formatted message.
         """
+        # Use compressed content for tool messages if compression is active
+        if message.role == "tool":
+            content = message.get_content(use_compressed_content=compress_tool_results)
+        else:
+            content = message.content if message.content is not None else ""
+
         # Basic message content
         message_dict: Dict[str, Any] = {
             "role": message.role,
-            "content": message.content if message.content is not None else "",
+            "content": content,
         }
 
         # Add name if present
@@ -377,7 +396,7 @@ class Cerebras(Model):
             message_dict = {
                 "role": "tool",
                 "tool_call_id": message.tool_call_id,
-                "content": message.content if message.content is not None else "",
+                "content": content,
             }
 
         # Ensure no None values in the message

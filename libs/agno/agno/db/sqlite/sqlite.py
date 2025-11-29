@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 from uuid import uuid4
 
 from agno.db.base import BaseDb, SessionType
+from agno.db.migrations.manager import MigrationManager
+from agno.db.schemas.culture import CulturalKnowledge
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
 from agno.db.schemas.memory import UserMemory
@@ -13,10 +15,12 @@ from agno.db.sqlite.utils import (
     apply_sorting,
     bulk_upsert_metrics,
     calculate_date_metrics,
+    deserialize_cultural_knowledge_from_db,
     fetch_all_sessions_data,
     get_dates_to_calculate_metrics_for,
     is_table_available,
     is_valid_table,
+    serialize_cultural_knowledge_for_db,
 )
 from agno.db.utils import deserialize_session_json_fields, serialize_session_json_fields
 from agno.session import AgentSession, Session, TeamSession, WorkflowSession
@@ -24,7 +28,7 @@ from agno.utils.log import log_debug, log_error, log_info, log_warning
 from agno.utils.string import generate_id
 
 try:
-    from sqlalchemy import Column, MetaData, Table, and_, func, select, text
+    from sqlalchemy import Column, MetaData, String, Table, func, select, text
     from sqlalchemy.dialects import sqlite
     from sqlalchemy.engine import Engine, create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
@@ -36,14 +40,16 @@ except ImportError:
 class SqliteDb(BaseDb):
     def __init__(
         self,
+        db_file: Optional[str] = None,
         db_engine: Optional[Engine] = None,
         db_url: Optional[str] = None,
-        db_file: Optional[str] = None,
         session_table: Optional[str] = None,
+        culture_table: Optional[str] = None,
         memory_table: Optional[str] = None,
         metrics_table: Optional[str] = None,
         eval_table: Optional[str] = None,
         knowledge_table: Optional[str] = None,
+        versions_table: Optional[str] = None,
         id: Optional[str] = None,
     ):
         """
@@ -56,14 +62,16 @@ class SqliteDb(BaseDb):
             4. Create a new database in the current directory
 
         Args:
+            db_file (Optional[str]): The database file to connect to.
             db_engine (Optional[Engine]): The SQLAlchemy database engine to use.
             db_url (Optional[str]): The database URL to connect to.
-            db_file (Optional[str]): The database file to connect to.
             session_table (Optional[str]): Name of the table to store Agent, Team and Workflow sessions.
+            culture_table (Optional[str]): Name of the table to store cultural notions.
             memory_table (Optional[str]): Name of the table to store user memories.
             metrics_table (Optional[str]): Name of the table to store metrics.
             eval_table (Optional[str]): Name of the table to store evaluation runs data.
             knowledge_table (Optional[str]): Name of the table to store knowledge documents data.
+            versions_table (Optional[str]): Name of the table to store schema versions.
             id (Optional[str]): ID of the database.
 
         Raises:
@@ -76,10 +84,12 @@ class SqliteDb(BaseDb):
         super().__init__(
             id=id,
             session_table=session_table,
+            culture_table=culture_table,
             memory_table=memory_table,
             metrics_table=metrics_table,
             eval_table=eval_table,
             knowledge_table=knowledge_table,
+            versions_table=versions_table,
         )
 
         _engine: Optional[Engine] = db_engine
@@ -107,6 +117,31 @@ class SqliteDb(BaseDb):
         self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
 
     # -- DB methods --
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a table with the given name exists in the SQLite database.
+
+        Args:
+            table_name: Name of the table to check
+
+        Returns:
+            bool: True if the table exists in the database, False otherwise
+        """
+        with self.Session() as sess:
+            return is_table_available(session=sess, table_name=table_name)
+
+    def _create_all_tables(self):
+        """Create all tables for the database."""
+        tables_to_create = [
+            (self.session_table_name, "sessions"),
+            (self.memory_table_name, "memories"),
+            (self.metrics_table_name, "metrics"),
+            (self.eval_table_name, "evals"),
+            (self.knowledge_table_name, "knowledge"),
+            (self.versions_table_name, "versions"),
+        ]
+
+        for table_name, table_type in tables_to_create:
+            self._get_or_create_table(table_name=table_name, table_type=table_type, create_table_if_not_found=True)
 
     def _create_table(self, table_name: str, table_type: str) -> Table:
         """
@@ -121,7 +156,6 @@ class SqliteDb(BaseDb):
         """
         try:
             table_schema = get_table_schema_definition(table_type)
-            log_debug(f"Creating table {table_name} with schema: {table_schema}")
 
             columns: List[Column] = []
             indexes: List[str] = []
@@ -146,8 +180,7 @@ class SqliteDb(BaseDb):
                 columns.append(Column(*column_args, **column_kwargs))  # type: ignore
 
             # Create the table object
-            table_metadata = MetaData()
-            table = Table(table_name, table_metadata, *columns)
+            table = Table(table_name, self.metadata, *columns)
 
             # Add multi-column unique constraints with table-specific names
             for constraint in schema_unique_constraints:
@@ -161,12 +194,17 @@ class SqliteDb(BaseDb):
                 table.append_constraint(Index(idx_name, idx_col))
 
             # Create table
-            table.create(self.db_engine, checkfirst=True)
+            table_created = False
+            if not self.table_exists(table_name):
+                table.create(self.db_engine, checkfirst=True)
+                log_debug(f"Successfully created table '{table_name}'")
+                table_created = True
+            else:
+                log_debug(f"Table '{table_name}' already exists, skipping creation")
 
             # Create indexes
             for idx in table.indexes:
                 try:
-                    log_debug(f"Creating index: {idx.name}")
                     # Check if index already exists
                     with self.Session() as sess:
                         exists_query = text("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :index_name")
@@ -177,13 +215,21 @@ class SqliteDb(BaseDb):
 
                     idx.create(self.db_engine)
 
+                    log_debug(f"Created index: {idx.name} for table {table_name}")
                 except Exception as e:
                     log_warning(f"Error creating index {idx.name}: {e}")
 
-            log_info(f"Successfully created table '{table_name}'")
+            # Store the schema version for the created table
+            if table_name != self.versions_table_name and table_created:
+                latest_schema_version = MigrationManager(self).latest_schema_version
+                self.upsert_schema_version(table_name=table_name, version=latest_schema_version.public)
+
             return table
 
         except Exception as e:
+            from traceback import format_exc
+
+            print(format_exc())
             log_error(f"Could not create table '{table_name}': {e}")
             raise e
 
@@ -229,11 +275,30 @@ class SqliteDb(BaseDb):
             )
             return self.knowledge_table
 
+        elif table_type == "culture":
+            self.culture_table = self._get_or_create_table(
+                table_name=self.culture_table_name,
+                table_type="culture",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.culture_table
+
+        elif table_type == "versions":
+            self.versions_table = self._get_or_create_table(
+                table_name=self.versions_table_name,
+                table_type="versions",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.versions_table
+
         else:
             raise ValueError(f"Unknown table type: '{table_type}'")
 
     def _get_or_create_table(
-        self, table_name: str, table_type: str, create_table_if_not_found: Optional[bool] = False
+        self,
+        table_name: str,
+        table_type: str,
+        create_table_if_not_found: Optional[bool] = False,
     ) -> Optional[Table]:
         """
         Check if the table exists and is valid, else create it.
@@ -251,6 +316,7 @@ class SqliteDb(BaseDb):
         if not table_is_available:
             if not create_table_if_not_found:
                 return None
+
             return self._create_table(table_name=table_name, table_type=table_type)
 
         # SQLite version of table validation (no schema)
@@ -265,6 +331,42 @@ class SqliteDb(BaseDb):
         except Exception as e:
             log_error(f"Error loading existing table {table_name}: {e}")
             raise e
+
+    def get_latest_schema_version(self, table_name: str):
+        """Get the latest version of the database schema."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        if table is None:
+            return "2.0.0"
+        with self.Session() as sess:
+            stmt = select(table)
+            # Latest version for the given table
+            stmt = stmt.where(table.c.table_name == table_name)
+            stmt = stmt.order_by(table.c.version.desc()).limit(1)
+            result = sess.execute(stmt).fetchone()
+            if result is None:
+                return "2.0.0"
+            version_dict = dict(result._mapping)
+            return version_dict.get("version") or "2.0.0"
+
+    def upsert_schema_version(self, table_name: str, version: str) -> None:
+        """Upsert the schema version into the database."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        if table is None:
+            return
+        current_datetime = datetime.now().isoformat()
+        with self.Session() as sess, sess.begin():
+            stmt = sqlite.insert(table).values(
+                table_name=table_name,
+                version=version,
+                created_at=current_datetime,  # Store as ISO format string
+                updated_at=current_datetime,
+            )
+            # Update version if table_name already exists
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["table_name"],
+                set_=dict(version=version, updated_at=current_datetime),
+            )
+            sess.execute(stmt)
 
     # -- Session methods --
 
@@ -357,8 +459,6 @@ class SqliteDb(BaseDb):
                 # Filtering
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == user_id)
-                if session_type is not None:
-                    stmt = stmt.where(table.c.session_type == session_type)
 
                 result = sess.execute(stmt).fetchone()
                 if result is None:
@@ -483,7 +583,11 @@ class SqliteDb(BaseDb):
             raise e
 
     def rename_session(
-        self, session_id: str, session_type: SessionType, session_name: str, deserialize: Optional[bool] = True
+        self,
+        session_id: str,
+        session_type: SessionType,
+        session_name: str,
+        deserialize: Optional[bool] = True,
     ) -> Optional[Union[Session, Dict[str, Any]]]:
         """
         Rename a session in the database.
@@ -664,7 +768,10 @@ class SqliteDb(BaseDb):
             raise e
 
     def upsert_sessions(
-        self, sessions: List[Session], deserialize: Optional[bool] = True
+        self,
+        sessions: List[Session],
+        deserialize: Optional[bool] = True,
+        preserve_updated_at: bool = False,
     ) -> List[Union[Session, Dict[str, Any]]]:
         """
         Bulk upsert multiple sessions for improved performance on large datasets.
@@ -672,6 +779,7 @@ class SqliteDb(BaseDb):
         Args:
             sessions (List[Session]): List of sessions to upsert.
             deserialize (Optional[bool]): Whether to deserialize the sessions. Defaults to True.
+            preserve_updated_at (bool): If True, preserve the updated_at from the session object.
 
         Returns:
             List[Union[Session, Dict[str, Any]]]: List of upserted sessions.
@@ -715,6 +823,8 @@ class SqliteDb(BaseDb):
                     agent_data = []
                     for session in agent_sessions:
                         serialized_session = serialize_session_json_fields(session.to_dict())
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = serialized_session.get("updated_at") if preserve_updated_at else int(time.time())
                         agent_data.append(
                             {
                                 "session_id": serialized_session.get("session_id"),
@@ -727,7 +837,7 @@ class SqliteDb(BaseDb):
                                 "runs": serialized_session.get("runs"),
                                 "summary": serialized_session.get("summary"),
                                 "created_at": serialized_session.get("created_at"),
-                                "updated_at": serialized_session.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -743,7 +853,7 @@ class SqliteDb(BaseDb):
                                 metadata=stmt.excluded.metadata,
                                 runs=stmt.excluded.runs,
                                 summary=stmt.excluded.summary,
-                                updated_at=int(time.time()),
+                                updated_at=stmt.excluded.updated_at,
                             ),
                         )
                         sess.execute(stmt, agent_data)
@@ -768,6 +878,8 @@ class SqliteDb(BaseDb):
                     team_data = []
                     for session in team_sessions:
                         serialized_session = serialize_session_json_fields(session.to_dict())
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = serialized_session.get("updated_at") if preserve_updated_at else int(time.time())
                         team_data.append(
                             {
                                 "session_id": serialized_session.get("session_id"),
@@ -777,7 +889,7 @@ class SqliteDb(BaseDb):
                                 "runs": serialized_session.get("runs"),
                                 "summary": serialized_session.get("summary"),
                                 "created_at": serialized_session.get("created_at"),
-                                "updated_at": serialized_session.get("created_at"),
+                                "updated_at": updated_at,
                                 "team_data": serialized_session.get("team_data"),
                                 "session_data": serialized_session.get("session_data"),
                                 "metadata": serialized_session.get("metadata"),
@@ -796,7 +908,7 @@ class SqliteDb(BaseDb):
                                 metadata=stmt.excluded.metadata,
                                 runs=stmt.excluded.runs,
                                 summary=stmt.excluded.summary,
-                                updated_at=int(time.time()),
+                                updated_at=stmt.excluded.updated_at,
                             ),
                         )
                         sess.execute(stmt, team_data)
@@ -821,6 +933,8 @@ class SqliteDb(BaseDb):
                     workflow_data = []
                     for session in workflow_sessions:
                         serialized_session = serialize_session_json_fields(session.to_dict())
+                        # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                        updated_at = serialized_session.get("updated_at") if preserve_updated_at else int(time.time())
                         workflow_data.append(
                             {
                                 "session_id": serialized_session.get("session_id"),
@@ -830,7 +944,7 @@ class SqliteDb(BaseDb):
                                 "runs": serialized_session.get("runs"),
                                 "summary": serialized_session.get("summary"),
                                 "created_at": serialized_session.get("created_at"),
-                                "updated_at": serialized_session.get("created_at"),
+                                "updated_at": updated_at,
                                 "workflow_data": serialized_session.get("workflow_data"),
                                 "session_data": serialized_session.get("session_data"),
                                 "metadata": serialized_session.get("metadata"),
@@ -849,7 +963,7 @@ class SqliteDb(BaseDb):
                                 metadata=stmt.excluded.metadata,
                                 runs=stmt.excluded.runs,
                                 summary=stmt.excluded.summary,
-                                updated_at=int(time.time()),
+                                updated_at=stmt.excluded.updated_at,
                             ),
                         )
                         sess.execute(stmt, workflow_data)
@@ -968,7 +1082,10 @@ class SqliteDb(BaseDb):
             raise e
 
     def get_user_memory(
-        self, memory_id: str, deserialize: Optional[bool] = True, user_id: Optional[str] = None
+        self,
+        memory_id: str,
+        deserialize: Optional[bool] = True,
+        user_id: Optional[str] = None,
     ) -> Optional[Union[UserMemory, Dict[str, Any]]]:
         """Get a memory from the database.
 
@@ -1060,8 +1177,8 @@ class SqliteDb(BaseDb):
                 if team_id is not None:
                     stmt = stmt.where(table.c.team_id == team_id)
                 if topics is not None:
-                    topic_conditions = [text(f"topics::text LIKE '%\"{topic}\"%'") for topic in topics]
-                    stmt = stmt.where(and_(*topic_conditions))
+                    for topic in topics:
+                        stmt = stmt.where(func.cast(table.c.topics, String).like(f'%"{topic}"%'))
                 if search_content is not None:
                     stmt = stmt.where(table.c.memory.ilike(f"%{search_content}%"))
 
@@ -1096,12 +1213,14 @@ class SqliteDb(BaseDb):
         self,
         limit: Optional[int] = None,
         page: Optional[int] = None,
+        user_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         """Get user memories stats.
 
         Args:
             limit (Optional[int]): The maximum number of user stats to return.
             page (Optional[int]): The page number.
+            user_id (Optional[str]): User ID for filtering.
 
         Returns:
             Tuple[List[Dict[str, Any]], int]: A list of dictionaries containing user stats and total count.
@@ -1124,19 +1243,20 @@ class SqliteDb(BaseDb):
                 return [], 0
 
             with self.Session() as sess, sess.begin():
-                stmt = (
-                    select(
-                        table.c.user_id,
-                        func.count(table.c.memory_id).label("total_memories"),
-                        func.max(table.c.updated_at).label("last_memory_updated_at"),
-                    )
-                    .where(table.c.user_id.is_not(None))
-                    .group_by(table.c.user_id)
-                    .order_by(func.max(table.c.updated_at).desc())
+                stmt = select(
+                    table.c.user_id,
+                    func.count(table.c.memory_id).label("total_memories"),
+                    func.max(table.c.updated_at).label("last_memory_updated_at"),
                 )
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
+                else:
+                    stmt = stmt.where(table.c.user_id.is_not(None))
+                stmt = stmt.group_by(table.c.user_id)
+                stmt = stmt.order_by(func.max(table.c.updated_at).desc())
 
                 count_stmt = select(func.count()).select_from(stmt.alias())
-                total_count = sess.execute(count_stmt).scalar()
+                total_count = sess.execute(count_stmt).scalar() or 0
 
                 # Pagination
                 if limit is not None:
@@ -1186,6 +1306,8 @@ class SqliteDb(BaseDb):
             if memory.memory_id is None:
                 memory.memory_id = str(uuid4())
 
+            current_time = int(time.time())
+
             with self.Session() as sess, sess.begin():
                 stmt = sqlite.insert(table).values(
                     user_id=memory.user_id,
@@ -1195,7 +1317,9 @@ class SqliteDb(BaseDb):
                     memory=memory.memory,
                     topics=memory.topics,
                     input=memory.input,
-                    updated_at=int(time.time()),
+                    feedback=memory.feedback,
+                    created_at=memory.created_at,
+                    updated_at=memory.created_at,
                 )
                 stmt = stmt.on_conflict_do_update(  # type: ignore
                     index_elements=["memory_id"],
@@ -1203,7 +1327,12 @@ class SqliteDb(BaseDb):
                         memory=memory.memory,
                         topics=memory.topics,
                         input=memory.input,
-                        updated_at=int(time.time()),
+                        agent_id=memory.agent_id,
+                        team_id=memory.team_id,
+                        feedback=memory.feedback,
+                        updated_at=current_time,
+                        # Preserve created_at on update - don't overwrite existing value
+                        created_at=table.c.created_at,
                     ),
                 ).returning(table)
 
@@ -1224,7 +1353,10 @@ class SqliteDb(BaseDb):
             raise e
 
     def upsert_memories(
-        self, memories: List[UserMemory], deserialize: Optional[bool] = True
+        self,
+        memories: List[UserMemory],
+        deserialize: Optional[bool] = True,
+        preserve_updated_at: bool = False,
     ) -> List[Union[UserMemory, Dict[str, Any]]]:
         """
         Bulk upsert multiple user memories for improved performance on large datasets.
@@ -1255,9 +1387,14 @@ class SqliteDb(BaseDb):
                 ]
             # Prepare bulk data
             bulk_data = []
+            current_time = int(time.time())
+
             for memory in memories:
                 if memory.memory_id is None:
                     memory.memory_id = str(uuid4())
+
+                # Use preserved updated_at if flag is set and value exists, otherwise use current time
+                updated_at = memory.updated_at if preserve_updated_at else current_time
 
                 bulk_data.append(
                     {
@@ -1267,7 +1404,10 @@ class SqliteDb(BaseDb):
                         "memory_id": memory.memory_id,
                         "memory": memory.memory,
                         "topics": memory.topics,
-                        "updated_at": int(time.time()),
+                        "input": memory.input,
+                        "feedback": memory.feedback,
+                        "created_at": memory.created_at,
+                        "updated_at": updated_at,
                     }
                 )
 
@@ -1284,7 +1424,10 @@ class SqliteDb(BaseDb):
                         input=stmt.excluded.input,
                         agent_id=stmt.excluded.agent_id,
                         team_id=stmt.excluded.team_id,
-                        updated_at=int(time.time()),
+                        feedback=stmt.excluded.feedback,
+                        updated_at=stmt.excluded.updated_at,
+                        # Preserve created_at on update
+                        created_at=table.c.created_at,
                     ),
                 )
                 sess.execute(stmt, bulk_data)
@@ -1450,7 +1593,9 @@ class SqliteDb(BaseDb):
                 start_timestamp=start_timestamp, end_timestamp=end_timestamp
             )
             all_sessions_data = fetch_all_sessions_data(
-                sessions=sessions, dates_to_process=dates_to_process, start_timestamp=start_timestamp
+                sessions=sessions,
+                dates_to_process=dates_to_process,
+                start_timestamp=start_timestamp,
             )
             if not all_sessions_data:
                 log_info("No new session data found. Won't calculate metrics.")
@@ -1697,7 +1842,11 @@ class SqliteDb(BaseDb):
             with self.Session() as sess, sess.begin():
                 current_time = int(time.time())
                 stmt = sqlite.insert(table).values(
-                    {"created_at": current_time, "updated_at": current_time, **eval_run.model_dump()}
+                    {
+                        "created_at": current_time,
+                        "updated_at": current_time,
+                        **eval_run.model_dump(),
+                    }
                 )
                 sess.execute(stmt)
                 sess.commit()
@@ -1987,3 +2136,234 @@ class SqliteDb(BaseDb):
             for memory in memories:
                 self.upsert_user_memory(memory)
             log_info(f"Migrated {len(memories)} memories to table: {self.memory_table}")
+
+    # -- Culture methods --
+
+    def clear_cultural_knowledge(self) -> None:
+        """Delete all cultural artifacts from the database.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                sess.execute(table.delete())
+
+        except Exception as e:
+            from agno.utils.log import log_warning
+
+            log_warning(f"Exception deleting all cultural artifacts: {e}")
+            raise e
+
+    def delete_cultural_knowledge(self, id: str) -> None:
+        """Delete a cultural artifact from the database.
+
+        Args:
+            id (str): The ID of the cultural artifact to delete.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                delete_stmt = table.delete().where(table.c.id == id)
+                result = sess.execute(delete_stmt)
+
+                success = result.rowcount > 0
+                if success:
+                    log_debug(f"Successfully deleted cultural artifact id: {id}")
+                else:
+                    log_debug(f"No cultural artifact found with id: {id}")
+
+        except Exception as e:
+            log_error(f"Error deleting cultural artifact: {e}")
+            raise e
+
+    def get_cultural_knowledge(
+        self, id: str, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Get a cultural artifact from the database.
+
+        Args:
+            id (str): The ID of the cultural artifact to get.
+            deserialize (Optional[bool]): Whether to serialize the cultural artifact. Defaults to True.
+
+        Returns:
+            Optional[CulturalKnowledge]: The cultural artifact, or None if it doesn't exist.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return None
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table).where(table.c.id == id)
+                result = sess.execute(stmt).fetchone()
+                if result is None:
+                    return None
+
+                db_row = dict(result._mapping)
+                if not db_row or not deserialize:
+                    return db_row
+
+            return deserialize_cultural_knowledge_from_db(db_row)
+
+        except Exception as e:
+            log_error(f"Exception reading from cultural artifacts table: {e}")
+            raise e
+
+    def get_all_cultural_knowledge(
+        self,
+        name: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+        """Get all cultural artifacts from the database as CulturalNotion objects.
+
+        Args:
+            name (Optional[str]): The name of the cultural artifact to filter by.
+            agent_id (Optional[str]): The ID of the agent to filter by.
+            team_id (Optional[str]): The ID of the team to filter by.
+            limit (Optional[int]): The maximum number of cultural artifacts to return.
+            page (Optional[int]): The page number.
+            sort_by (Optional[str]): The column to sort by.
+            sort_order (Optional[str]): The order to sort by.
+            deserialize (Optional[bool]): Whether to serialize the cultural artifacts. Defaults to True.
+
+        Returns:
+            Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+                - When deserialize=True: List of CulturalNotion objects
+                - When deserialize=False: List of CulturalNotion dictionaries and total count
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return [] if deserialize else ([], 0)
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table)
+
+                # Filtering
+                if name is not None:
+                    stmt = stmt.where(table.c.name == name)
+                if agent_id is not None:
+                    stmt = stmt.where(table.c.agent_id == agent_id)
+                if team_id is not None:
+                    stmt = stmt.where(table.c.team_id == team_id)
+
+                # Get total count after applying filtering
+                count_stmt = select(func.count()).select_from(stmt.alias())
+                total_count = sess.execute(count_stmt).scalar()
+
+                # Sorting
+                stmt = apply_sorting(stmt, table, sort_by, sort_order)
+                # Paginating
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+                    if page is not None:
+                        stmt = stmt.offset((page - 1) * limit)
+
+                result = sess.execute(stmt).fetchall()
+                if not result:
+                    return [] if deserialize else ([], 0)
+
+                db_rows = [dict(record._mapping) for record in result]
+
+                if not deserialize:
+                    return db_rows, total_count
+
+            return [deserialize_cultural_knowledge_from_db(row) for row in db_rows]
+
+        except Exception as e:
+            log_error(f"Error reading from cultural artifacts table: {e}")
+            raise e
+
+    def upsert_cultural_knowledge(
+        self, cultural_knowledge: CulturalKnowledge, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Upsert a cultural artifact into the database.
+
+        Args:
+            cultural_knowledge (CulturalKnowledge): The cultural artifact to upsert.
+            deserialize (Optional[bool]): Whether to serialize the cultural artifact. Defaults to True.
+
+        Returns:
+            Optional[Union[CulturalNotion, Dict[str, Any]]]:
+                - When deserialize=True: CulturalNotion object
+                - When deserialize=False: CulturalNotion dictionary
+
+        Raises:
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
+            if table is None:
+                return None
+
+            if cultural_knowledge.id is None:
+                cultural_knowledge.id = str(uuid4())
+
+            # Serialize content, categories, and notes into a JSON string for DB storage (SQLite requires strings)
+            content_json_str = serialize_cultural_knowledge_for_db(cultural_knowledge)
+
+            with self.Session() as sess, sess.begin():
+                stmt = sqlite.insert(table).values(
+                    id=cultural_knowledge.id,
+                    name=cultural_knowledge.name,
+                    summary=cultural_knowledge.summary,
+                    content=content_json_str,
+                    metadata=cultural_knowledge.metadata,
+                    input=cultural_knowledge.input,
+                    created_at=cultural_knowledge.created_at,
+                    updated_at=int(time.time()),
+                    agent_id=cultural_knowledge.agent_id,
+                    team_id=cultural_knowledge.team_id,
+                )
+                stmt = stmt.on_conflict_do_update(  # type: ignore
+                    index_elements=["id"],
+                    set_=dict(
+                        name=cultural_knowledge.name,
+                        summary=cultural_knowledge.summary,
+                        content=content_json_str,
+                        metadata=cultural_knowledge.metadata,
+                        input=cultural_knowledge.input,
+                        updated_at=int(time.time()),
+                        agent_id=cultural_knowledge.agent_id,
+                        team_id=cultural_knowledge.team_id,
+                    ),
+                ).returning(table)
+
+                result = sess.execute(stmt)
+                row = result.fetchone()
+
+                if row is None:
+                    return None
+
+            db_row: Dict[str, Any] = dict(row._mapping)
+            if not db_row or not deserialize:
+                return db_row
+
+            return deserialize_cultural_knowledge_from_db(db_row)
+
+        except Exception as e:
+            log_error(f"Error upserting cultural knowledge: {e}")
+            raise e

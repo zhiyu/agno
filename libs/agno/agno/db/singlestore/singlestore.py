@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 from agno.db.base import BaseDb, SessionType
+from agno.db.migrations.manager import MigrationManager
+from agno.db.schemas.culture import CulturalKnowledge
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
 from agno.db.schemas.memory import UserMemory
@@ -14,22 +16,24 @@ from agno.db.singlestore.utils import (
     bulk_upsert_metrics,
     calculate_date_metrics,
     create_schema,
+    deserialize_cultural_knowledge_from_db,
     fetch_all_sessions_data,
     get_dates_to_calculate_metrics_for,
     is_table_available,
     is_valid_table,
+    serialize_cultural_knowledge_for_db,
 )
 from agno.session import AgentSession, Session, TeamSession, WorkflowSession
 from agno.utils.log import log_debug, log_error, log_info, log_warning
 from agno.utils.string import generate_id
 
 try:
-    from sqlalchemy import Index, UniqueConstraint, and_, func, update
+    from sqlalchemy import Index, UniqueConstraint, and_, func, select, update
     from sqlalchemy.dialects import mysql
     from sqlalchemy.engine import Engine, create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
     from sqlalchemy.schema import Column, MetaData, Table
-    from sqlalchemy.sql.expression import select, text
+    from sqlalchemy.sql.expression import text
 except ImportError:
     raise ImportError("`sqlalchemy` not installed. Please install it using `pip install sqlalchemy`")
 
@@ -42,10 +46,12 @@ class SingleStoreDb(BaseDb):
         db_schema: Optional[str] = None,
         db_url: Optional[str] = None,
         session_table: Optional[str] = None,
+        culture_table: Optional[str] = None,
         memory_table: Optional[str] = None,
         metrics_table: Optional[str] = None,
         eval_table: Optional[str] = None,
         knowledge_table: Optional[str] = None,
+        versions_table: Optional[str] = None,
     ):
         """
         Interface for interacting with a SingleStore database.
@@ -61,11 +67,12 @@ class SingleStoreDb(BaseDb):
             db_schema (Optional[str]): The database schema to use.
             db_url (Optional[str]): The database URL to connect to.
             session_table (Optional[str]): Name of the table to store Agent, Team and Workflow sessions.
+            culture_table (Optional[str]): Name of the table to store cultural knowledge.
             memory_table (Optional[str]): Name of the table to store memories.
             metrics_table (Optional[str]): Name of the table to store metrics.
             eval_table (Optional[str]): Name of the table to store evaluation runs data.
             knowledge_table (Optional[str]): Name of the table to store knowledge content.
-
+            versions_table (Optional[str]): Name of the table to store schema versions.
         Raises:
             ValueError: If neither db_url nor db_engine is provided.
             ValueError: If none of the tables are provided.
@@ -79,10 +86,12 @@ class SingleStoreDb(BaseDb):
         super().__init__(
             id=id,
             session_table=session_table,
+            culture_table=culture_table,
             memory_table=memory_table,
             metrics_table=metrics_table,
             eval_table=eval_table,
             knowledge_table=knowledge_table,
+            versions_table=versions_table,
         )
 
         _engine: Optional[Engine] = db_engine
@@ -100,14 +109,25 @@ class SingleStoreDb(BaseDb):
         self.db_url: Optional[str] = db_url
         self.db_engine: Engine = _engine
         self.db_schema: Optional[str] = db_schema
-        self.metadata: MetaData = MetaData()
+        self.metadata: MetaData = MetaData(schema=self.db_schema)
 
         # Initialize database session
         self.Session: scoped_session = scoped_session(sessionmaker(bind=self.db_engine))
 
     # -- DB methods --
+    def table_exists(self, table_name: str) -> bool:
+        """Check if a table with the given name exists in the SingleStore database.
 
-    def _create_table_structure_only(self, table_name: str, table_type: str, db_schema: Optional[str]) -> Table:
+        Args:
+            table_name: Name of the table to check
+
+        Returns:
+            bool: True if the table exists in the database, False otherwise
+        """
+        with self.Session() as sess:
+            return is_table_available(session=sess, table_name=table_name, db_schema=self.db_schema)
+
+    def _create_table_structure_only(self, table_name: str, table_type: str) -> Table:
         """
         Create a table structure definition without actually creating the table in the database.
         Used to avoid autoload issues with SingleStore JSON types.
@@ -115,7 +135,6 @@ class SingleStoreDb(BaseDb):
         Args:
             table_name (str): Name of the table
             table_type (str): Type of table (used to get schema definition)
-            db_schema (Optional[str]): Database schema name
 
         Returns:
             Table: SQLAlchemy Table object with column definitions
@@ -141,33 +160,43 @@ class SingleStoreDb(BaseDb):
                 columns.append(Column(*column_args, **column_kwargs))
 
             # Create the table object without constraints to avoid autoload issues
-            table_metadata = MetaData(schema=db_schema)
-            table = Table(table_name, table_metadata, *columns, schema=db_schema)
+            table = Table(table_name, self.metadata, *columns, schema=self.db_schema)
 
             return table
 
         except Exception as e:
-            table_ref = f"{db_schema}.{table_name}" if db_schema else table_name
+            table_ref = f"{self.db_schema}.{table_name}" if self.db_schema else table_name
             log_error(f"Could not create table structure for {table_ref}: {e}")
             raise
 
-    def _create_table(self, table_name: str, table_type: str, db_schema: Optional[str]) -> Table:
+    def _create_all_tables(self):
+        """Create all tables for the database."""
+        tables_to_create = [
+            (self.session_table_name, "sessions"),
+            (self.memory_table_name, "memories"),
+            (self.metrics_table_name, "metrics"),
+            (self.eval_table_name, "evals"),
+            (self.knowledge_table_name, "knowledge"),
+            (self.versions_table_name, "versions"),
+        ]
+
+        for table_name, table_type in tables_to_create:
+            self._get_or_create_table(table_name=table_name, table_type=table_type, create_table_if_not_found=True)
+
+    def _create_table(self, table_name: str, table_type: str) -> Table:
         """
         Create a table with the appropriate schema based on the table type.
 
         Args:
             table_name (str): Name of the table to create
             table_type (str): Type of table (used to get schema definition)
-            db_schema (Optional[str]): Database schema name
 
         Returns:
             Table: SQLAlchemy Table object
         """
-        table_ref = f"{db_schema}.{table_name}" if db_schema else table_name
+        table_ref = f"{self.db_schema}.{table_name}" if self.db_schema else table_name
         try:
             table_schema = get_table_schema_definition(table_type)
-
-            log_debug(f"Creating table {table_ref} with schema: {table_schema}")
 
             columns: List[Column] = []
             indexes: List[str] = []
@@ -190,8 +219,7 @@ class SingleStoreDb(BaseDb):
                 columns.append(Column(*column_args, **column_kwargs))
 
             # Create the table object
-            table_metadata = MetaData(schema=db_schema)
-            table = Table(table_name, table_metadata, *columns, schema=db_schema)
+            table = Table(table_name, self.metadata, *columns, schema=self.db_schema)
 
             # Add multi-column unique constraints with table-specific names
             for constraint in schema_unique_constraints:
@@ -205,48 +233,52 @@ class SingleStoreDb(BaseDb):
                 table.append_constraint(Index(idx_name, idx_col))
 
             # Create schema if one is specified
-            if db_schema is not None:
+            if self.db_schema is not None:
                 with self.Session() as sess, sess.begin():
-                    create_schema(session=sess, db_schema=db_schema)
+                    create_schema(session=sess, db_schema=self.db_schema)
 
             # SingleStore has a limitation on the number of unique multi-field constraints per table.
             # We need to work around that limitation for the sessions table.
-            if table_type == "sessions":
-                with self.Session() as sess, sess.begin():
-                    # Build column definitions
-                    columns_sql = []
-                    for col in table.columns:
-                        col_sql = f"{col.name} {col.type.compile(self.db_engine.dialect)}"
-                        if not col.nullable:
-                            col_sql += " NOT NULL"
-                        columns_sql.append(col_sql)
+            table_created = False
+            if not self.table_exists(table_name):
+                if table_type == "sessions":
+                    with self.Session() as sess, sess.begin():
+                        # Build column definitions
+                        columns_sql = []
+                        for col in table.columns:
+                            col_sql = f"{col.name} {col.type.compile(self.db_engine.dialect)}"
+                            if not col.nullable:
+                                col_sql += " NOT NULL"
+                            columns_sql.append(col_sql)
 
-                    columns_def = ", ".join(columns_sql)
+                        columns_def = ", ".join(columns_sql)
 
-                    # Add shard key and single unique constraint
-                    table_sql = f"""CREATE TABLE IF NOT EXISTS {table_ref} (
-                        {columns_def},
-                        SHARD KEY (session_id),
-                        UNIQUE KEY uq_session_type (session_id, session_type)
-                    )"""
+                        # Add shard key and single unique constraint
+                        table_sql = f"""CREATE TABLE IF NOT EXISTS {table_ref} (
+                            {columns_def},
+                            SHARD KEY (session_id),
+                            UNIQUE KEY uq_session_type (session_id, session_type)
+                        )"""
 
-                    sess.execute(text(table_sql))
+                        sess.execute(text(table_sql))
+                else:
+                    table.create(self.db_engine, checkfirst=True)
+                log_debug(f"Successfully created table '{table_ref}'")
+                table_created = True
             else:
-                table.create(self.db_engine, checkfirst=True)
+                log_debug(f"Table '{table_ref}' already exists, skipping creation")
 
             # Create indexes
             for idx in table.indexes:
                 try:
-                    log_debug(f"Creating index: {idx.name}")
-
                     # Check if index already exists
                     with self.Session() as sess:
-                        if db_schema is not None:
+                        if self.db_schema is not None:
                             exists_query = text(
                                 "SELECT 1 FROM information_schema.statistics WHERE table_schema = :schema AND index_name = :index_name"
                             )
                             exists = (
-                                sess.execute(exists_query, {"schema": db_schema, "index_name": idx.name}).scalar()
+                                sess.execute(exists_query, {"schema": self.db_schema, "index_name": idx.name}).scalar()
                                 is not None
                             )
                         else:
@@ -260,10 +292,15 @@ class SingleStoreDb(BaseDb):
 
                     idx.create(self.db_engine)
 
+                    log_debug(f"Created index: {idx.name} for table {table_ref}")
                 except Exception as e:
                     log_error(f"Error creating index {idx.name}: {e}")
 
-            log_debug(f"Successfully created table {table_ref}")
+            # Store the schema version for the created table
+            if table_name != self.versions_table_name and table_created:
+                latest_schema_version = MigrationManager(self).latest_schema_version
+                self.upsert_schema_version(table_name=table_name, version=latest_schema_version.public)
+
             return table
 
         except Exception as e:
@@ -275,7 +312,6 @@ class SingleStoreDb(BaseDb):
             self.session_table = self._get_or_create_table(
                 table_name=self.session_table_name,
                 table_type="sessions",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.session_table
@@ -284,7 +320,6 @@ class SingleStoreDb(BaseDb):
             self.memory_table = self._get_or_create_table(
                 table_name=self.memory_table_name,
                 table_type="memories",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.memory_table
@@ -293,7 +328,6 @@ class SingleStoreDb(BaseDb):
             self.metrics_table = self._get_or_create_table(
                 table_name=self.metrics_table_name,
                 table_type="metrics",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.metrics_table
@@ -302,7 +336,6 @@ class SingleStoreDb(BaseDb):
             self.eval_table = self._get_or_create_table(
                 table_name=self.eval_table_name,
                 table_type="evals",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.eval_table
@@ -311,10 +344,25 @@ class SingleStoreDb(BaseDb):
             self.knowledge_table = self._get_or_create_table(
                 table_name=self.knowledge_table_name,
                 table_type="knowledge",
-                db_schema=self.db_schema,
                 create_table_if_not_found=create_table_if_not_found,
             )
             return self.knowledge_table
+
+        if table_type == "culture":
+            self.culture_table = self._get_or_create_table(
+                table_name=self.culture_table_name,
+                table_type="culture",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.culture_table
+
+        if table_type == "versions":
+            self.versions_table = self._get_or_create_table(
+                table_name=self.versions_table_name,
+                table_type="versions",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.versions_table
 
         raise ValueError(f"Unknown table type: {table_type}")
 
@@ -322,7 +370,6 @@ class SingleStoreDb(BaseDb):
         self,
         table_name: str,
         table_type: str,
-        db_schema: Optional[str],
         create_table_if_not_found: Optional[bool] = False,
     ) -> Optional[Table]:
         """
@@ -331,36 +378,77 @@ class SingleStoreDb(BaseDb):
         Args:
             table_name (str): Name of the table to get or create
             table_type (str): Type of table (used to get schema definition)
-            db_schema (Optional[str]): Database schema name
 
         Returns:
             Table: SQLAlchemy Table object representing the schema.
         """
 
         with self.Session() as sess, sess.begin():
-            table_is_available = is_table_available(session=sess, table_name=table_name, db_schema=db_schema)
+            table_is_available = is_table_available(session=sess, table_name=table_name, db_schema=self.db_schema)
 
         if not table_is_available:
             if not create_table_if_not_found:
                 return None
-            return self._create_table(table_name=table_name, table_type=table_type, db_schema=db_schema)
+
+            # Also store the schema version for the created table
+            if table_name != self.versions_table_name:
+                latest_schema_version = MigrationManager(self).latest_schema_version
+                self.upsert_schema_version(table_name=table_name, version=latest_schema_version.public)
+
+            return self._create_table(table_name=table_name, table_type=table_type)
 
         if not is_valid_table(
             db_engine=self.db_engine,
             table_name=table_name,
             table_type=table_type,
-            db_schema=db_schema,
+            db_schema=self.db_schema,
         ):
-            table_ref = f"{db_schema}.{table_name}" if db_schema else table_name
+            table_ref = f"{self.db_schema}.{table_name}" if self.db_schema else table_name
             raise ValueError(f"Table {table_ref} has an invalid schema")
 
         try:
-            return self._create_table_structure_only(table_name=table_name, table_type=table_type, db_schema=db_schema)
+            return self._create_table_structure_only(table_name=table_name, table_type=table_type)
 
         except Exception as e:
-            table_ref = f"{db_schema}.{table_name}" if db_schema else table_name
+            table_ref = f"{self.db_schema}.{table_name}" if self.db_schema else table_name
             log_error(f"Error loading existing table {table_ref}: {e}")
             raise
+
+    def get_latest_schema_version(self, table_name: str) -> str:
+        """Get the latest version of the database schema."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        if table is None:
+            return "2.0.0"
+        with self.Session() as sess:
+            stmt = select(table)
+            # Latest version for the given table
+            stmt = stmt.where(table.c.table_name == table_name)
+            stmt = stmt.order_by(table.c.version.desc()).limit(1)
+            result = sess.execute(stmt).fetchone()
+            if result is None:
+                return "2.0.0"
+            version_dict = dict(result._mapping)
+            return version_dict.get("version") or "2.0.0"
+
+    def upsert_schema_version(self, table_name: str, version: str) -> None:
+        """Upsert the schema version into the database."""
+        table = self._get_table(table_type="versions", create_table_if_not_found=True)
+        if table is None:
+            return
+        current_datetime = datetime.now().isoformat()
+        with self.Session() as sess, sess.begin():
+            stmt = mysql.insert(table).values(
+                table_name=table_name,
+                version=version,
+                created_at=current_datetime,  # Store as ISO format string
+                updated_at=current_datetime,
+            )
+            # Update version if table_name already exists
+            stmt = stmt.on_duplicate_key_update(
+                version=version,
+                updated_at=current_datetime,
+            )
+            sess.execute(stmt)
 
     # -- Session methods --
     def delete_session(self, session_id: str) -> bool:
@@ -454,9 +542,6 @@ class SingleStoreDb(BaseDb):
 
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == user_id)
-                if session_type is not None:
-                    session_type_value = session_type.value if isinstance(session_type, SessionType) else session_type
-                    stmt = stmt.where(table.c.session_type == session_type_value)
                 result = sess.execute(stmt).fetchone()
                 if result is None:
                     return None
@@ -797,7 +882,7 @@ class SingleStoreDb(BaseDb):
             raise e
 
     def upsert_sessions(
-        self, sessions: List[Session], deserialize: Optional[bool] = True
+        self, sessions: List[Session], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
     ) -> List[Union[Session, Dict[str, Any]]]:
         """
         Bulk upsert multiple sessions for improved performance on large datasets.
@@ -841,6 +926,8 @@ class SingleStoreDb(BaseDb):
                     agent_data = []
                     for session in agent_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         agent_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -853,7 +940,7 @@ class SingleStoreDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -867,7 +954,7 @@ class SingleStoreDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, agent_data)
 
@@ -890,6 +977,8 @@ class SingleStoreDb(BaseDb):
                     team_data = []
                     for session in team_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         team_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -902,7 +991,7 @@ class SingleStoreDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -916,7 +1005,7 @@ class SingleStoreDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, team_data)
 
@@ -939,6 +1028,8 @@ class SingleStoreDb(BaseDb):
                     workflow_data = []
                     for session in workflow_sessions:
                         session_dict = session.to_dict()
+                        # Use preserved updated_at if flag is set, otherwise use current time
+                        updated_at = session_dict.get("updated_at") if preserve_updated_at else int(time.time())
                         workflow_data.append(
                             {
                                 "session_id": session_dict.get("session_id"),
@@ -951,7 +1042,7 @@ class SingleStoreDb(BaseDb):
                                 "summary": session_dict.get("summary"),
                                 "metadata": session_dict.get("metadata"),
                                 "created_at": session_dict.get("created_at"),
-                                "updated_at": session_dict.get("created_at"),
+                                "updated_at": updated_at,
                             }
                         )
 
@@ -965,7 +1056,7 @@ class SingleStoreDb(BaseDb):
                             summary=stmt.inserted.summary,
                             metadata=stmt.inserted.metadata,
                             runs=stmt.inserted.runs,
-                            updated_at=int(time.time()),
+                            updated_at=stmt.inserted.updated_at,
                         )
                         sess.execute(stmt, workflow_data)
 
@@ -1205,13 +1296,14 @@ class SingleStoreDb(BaseDb):
             raise e
 
     def get_user_memory_stats(
-        self, limit: Optional[int] = None, page: Optional[int] = None
+        self, limit: Optional[int] = None, page: Optional[int] = None, user_id: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], int]:
         """Get user memories stats.
 
         Args:
             limit (Optional[int]): The maximum number of user stats to return.
             page (Optional[int]): The page number.
+            user_id (Optional[str]): User ID for filtering.
 
         Returns:
             Tuple[List[Dict[str, Any]], int]: A list of dictionaries containing user stats and total count.
@@ -1234,16 +1326,17 @@ class SingleStoreDb(BaseDb):
                 return [], 0
 
             with self.Session() as sess, sess.begin():
-                stmt = (
-                    select(
-                        table.c.user_id,
-                        func.count(table.c.memory_id).label("total_memories"),
-                        func.max(table.c.updated_at).label("last_memory_updated_at"),
-                    )
-                    .where(table.c.user_id.is_not(None))
-                    .group_by(table.c.user_id)
-                    .order_by(func.max(table.c.updated_at).desc())
+                stmt = select(
+                    table.c.user_id,
+                    func.count(table.c.memory_id).label("total_memories"),
+                    func.max(table.c.updated_at).label("last_memory_updated_at"),
                 )
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
+                else:
+                    stmt = stmt.where(table.c.user_id.is_not(None))
+                stmt = stmt.group_by(table.c.user_id)
+                stmt = stmt.order_by(func.max(table.c.updated_at).desc())
 
                 count_stmt = select(func.count()).select_from(stmt.alias())
                 total_count = sess.execute(count_stmt).scalar()
@@ -1297,6 +1390,8 @@ class SingleStoreDb(BaseDb):
                 if memory.memory_id is None:
                     memory.memory_id = str(uuid4())
 
+                current_time = int(time.time())
+
                 stmt = mysql.insert(table).values(
                     memory_id=memory.memory_id,
                     memory=memory.memory,
@@ -1305,7 +1400,9 @@ class SingleStoreDb(BaseDb):
                     agent_id=memory.agent_id,
                     team_id=memory.team_id,
                     topics=memory.topics,
-                    updated_at=int(time.time()),
+                    feedback=memory.feedback,
+                    created_at=memory.created_at,
+                    updated_at=current_time,
                 )
                 stmt = stmt.on_duplicate_key_update(
                     memory=stmt.inserted.memory,
@@ -1314,7 +1411,10 @@ class SingleStoreDb(BaseDb):
                     user_id=stmt.inserted.user_id,
                     agent_id=stmt.inserted.agent_id,
                     team_id=stmt.inserted.team_id,
-                    updated_at=int(time.time()),
+                    feedback=stmt.inserted.feedback,
+                    updated_at=stmt.inserted.updated_at,
+                    # Preserve created_at on update - don't overwrite existing value
+                    created_at=table.c.created_at,
                 )
 
                 sess.execute(stmt)
@@ -1336,7 +1436,7 @@ class SingleStoreDb(BaseDb):
             raise e
 
     def upsert_memories(
-        self, memories: List[UserMemory], deserialize: Optional[bool] = True
+        self, memories: List[UserMemory], deserialize: Optional[bool] = True, preserve_updated_at: bool = False
     ) -> List[Union[UserMemory, Dict[str, Any]]]:
         """
         Bulk upsert multiple user memories for improved performance on large datasets.
@@ -1361,9 +1461,14 @@ class SingleStoreDb(BaseDb):
 
             # Prepare data for bulk insert
             memory_data = []
+            current_time = int(time.time())
+
             for memory in memories:
                 if memory.memory_id is None:
                     memory.memory_id = str(uuid4())
+                # Use preserved updated_at if flag is set, otherwise use current time
+                updated_at = memory.updated_at if preserve_updated_at else current_time
+
                 memory_data.append(
                     {
                         "memory_id": memory.memory_id,
@@ -1373,7 +1478,9 @@ class SingleStoreDb(BaseDb):
                         "agent_id": memory.agent_id,
                         "team_id": memory.team_id,
                         "topics": memory.topics,
-                        "updated_at": int(time.time()),
+                        "feedback": memory.feedback,
+                        "created_at": memory.created_at,
+                        "updated_at": updated_at,
                     }
                 )
 
@@ -1389,7 +1496,10 @@ class SingleStoreDb(BaseDb):
                         user_id=stmt.inserted.user_id,
                         agent_id=stmt.inserted.agent_id,
                         team_id=stmt.inserted.team_id,
-                        updated_at=int(time.time()),
+                        feedback=stmt.inserted.feedback,
+                        updated_at=stmt.inserted.updated_at,
+                        # Preserve created_at on update
+                        created_at=table.c.created_at,
                     )
                     sess.execute(stmt, memory_data)
 
@@ -2008,4 +2118,220 @@ class SingleStoreDb(BaseDb):
 
         except Exception as e:
             log_error(f"Error renaming eval run {eval_run_id}: {e}")
+            raise e
+
+    # -- Culture methods --
+
+    def clear_cultural_knowledge(self) -> None:
+        """Delete all cultural knowledge from the database.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                sess.execute(table.delete())
+
+        except Exception as e:
+            log_warning(f"Exception deleting all cultural knowledge: {e}")
+            raise e
+
+    def delete_cultural_knowledge(self, id: str) -> None:
+        """Delete a cultural knowledge entry from the database.
+
+        Args:
+            id (str): The ID of the cultural knowledge to delete.
+
+        Raises:
+            Exception: If an error occurs during deletion.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return
+
+            with self.Session() as sess, sess.begin():
+                delete_stmt = table.delete().where(table.c.id == id)
+                result = sess.execute(delete_stmt)
+
+                success = result.rowcount > 0
+                if success:
+                    log_debug(f"Successfully deleted cultural knowledge id: {id}")
+                else:
+                    log_debug(f"No cultural knowledge found with id: {id}")
+
+        except Exception as e:
+            log_error(f"Error deleting cultural knowledge: {e}")
+            raise e
+
+    def get_cultural_knowledge(
+        self, id: str, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Get a cultural knowledge entry from the database.
+
+        Args:
+            id (str): The ID of the cultural knowledge to get.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Optional[Union[CulturalKnowledge, Dict[str, Any]]]: The cultural knowledge entry, or None if it doesn't exist.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return None
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table).where(table.c.id == id)
+                result = sess.execute(stmt).fetchone()
+                if result is None:
+                    return None
+
+                db_row = dict(result._mapping)
+                if not db_row or not deserialize:
+                    return db_row
+
+            return deserialize_cultural_knowledge_from_db(db_row)
+
+        except Exception as e:
+            log_error(f"Exception reading from cultural knowledge table: {e}")
+            raise e
+
+    def get_all_cultural_knowledge(
+        self,
+        name: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: Optional[int] = None,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        deserialize: Optional[bool] = True,
+    ) -> Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+        """Get all cultural knowledge from the database as CulturalKnowledge objects.
+
+        Args:
+            name (Optional[str]): The name of the cultural knowledge to filter by.
+            agent_id (Optional[str]): The ID of the agent to filter by.
+            team_id (Optional[str]): The ID of the team to filter by.
+            limit (Optional[int]): The maximum number of cultural knowledge entries to return.
+            page (Optional[int]): The page number.
+            sort_by (Optional[str]): The column to sort by.
+            sort_order (Optional[str]): The order to sort by.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Union[List[CulturalKnowledge], Tuple[List[Dict[str, Any]], int]]:
+                - When deserialize=True: List of CulturalKnowledge objects
+                - When deserialize=False: List of CulturalKnowledge dictionaries and total count
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        try:
+            table = self._get_table(table_type="culture")
+            if table is None:
+                return [] if deserialize else ([], 0)
+
+            with self.Session() as sess, sess.begin():
+                stmt = select(table)
+
+                # Filtering
+                if name is not None:
+                    stmt = stmt.where(table.c.name == name)
+                if agent_id is not None:
+                    stmt = stmt.where(table.c.agent_id == agent_id)
+                if team_id is not None:
+                    stmt = stmt.where(table.c.team_id == team_id)
+
+                # Get total count after applying filtering
+                count_stmt = select(func.count()).select_from(stmt.alias())
+                total_count = sess.execute(count_stmt).scalar()
+
+                # Sorting
+                stmt = apply_sorting(stmt, table, sort_by, sort_order)
+                # Paginating
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+                    if page is not None:
+                        stmt = stmt.offset((page - 1) * limit)
+
+                result = sess.execute(stmt).fetchall()
+                if not result:
+                    return [] if deserialize else ([], 0)
+
+                db_rows = [dict(record._mapping) for record in result]
+
+                if not deserialize:
+                    return db_rows, total_count
+
+            return [deserialize_cultural_knowledge_from_db(row) for row in db_rows]
+
+        except Exception as e:
+            log_error(f"Error reading from cultural knowledge table: {e}")
+            raise e
+
+    def upsert_cultural_knowledge(
+        self, cultural_knowledge: CulturalKnowledge, deserialize: Optional[bool] = True
+    ) -> Optional[Union[CulturalKnowledge, Dict[str, Any]]]:
+        """Upsert a cultural knowledge entry into the database.
+
+        Args:
+            cultural_knowledge (CulturalKnowledge): The cultural knowledge to upsert.
+            deserialize (Optional[bool]): Whether to deserialize the cultural knowledge. Defaults to True.
+
+        Returns:
+            Optional[CulturalKnowledge]: The upserted cultural knowledge entry.
+
+        Raises:
+            Exception: If an error occurs during upsert.
+        """
+        try:
+            table = self._get_table(table_type="culture", create_table_if_not_found=True)
+            if table is None:
+                return None
+
+            if cultural_knowledge.id is None:
+                cultural_knowledge.id = str(uuid4())
+
+            # Serialize content, categories, and notes into a JSON dict for DB storage
+            content_dict = serialize_cultural_knowledge_for_db(cultural_knowledge)
+
+            with self.Session() as sess, sess.begin():
+                stmt = mysql.insert(table).values(
+                    id=cultural_knowledge.id,
+                    name=cultural_knowledge.name,
+                    summary=cultural_knowledge.summary,
+                    content=content_dict if content_dict else None,
+                    metadata=cultural_knowledge.metadata,
+                    input=cultural_knowledge.input,
+                    created_at=cultural_knowledge.created_at,
+                    updated_at=int(time.time()),
+                    agent_id=cultural_knowledge.agent_id,
+                    team_id=cultural_knowledge.team_id,
+                )
+                stmt = stmt.on_duplicate_key_update(
+                    name=cultural_knowledge.name,
+                    summary=cultural_knowledge.summary,
+                    content=content_dict if content_dict else None,
+                    metadata=cultural_knowledge.metadata,
+                    input=cultural_knowledge.input,
+                    updated_at=int(time.time()),
+                    agent_id=cultural_knowledge.agent_id,
+                    team_id=cultural_knowledge.team_id,
+                )
+                sess.execute(stmt)
+
+            # Fetch the inserted/updated row
+            return self.get_cultural_knowledge(id=cultural_knowledge.id, deserialize=deserialize)
+
+        except Exception as e:
+            log_error(f"Error upserting cultural knowledge: {e}")
             raise e

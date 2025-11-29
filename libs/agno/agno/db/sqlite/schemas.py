@@ -34,6 +34,8 @@ USER_MEMORY_TABLE_SCHEMA = {
     "team_id": {"type": String, "nullable": True},
     "user_id": {"type": String, "nullable": True, "index": True},
     "topics": {"type": JSON, "nullable": True},
+    "feedback": {"type": String, "nullable": True},
+    "created_at": {"type": BigInteger, "nullable": False, "index": True},
     "updated_at": {"type": BigInteger, "nullable": True, "index": True},
 }
 
@@ -93,6 +95,26 @@ METRICS_TABLE_SCHEMA = {
     ],
 }
 
+CULTURAL_KNOWLEDGE_TABLE_SCHEMA = {
+    "id": {"type": String, "primary_key": True, "nullable": False},
+    "name": {"type": String, "nullable": False, "index": True},
+    "summary": {"type": String, "nullable": True},
+    "content": {"type": JSON, "nullable": True},
+    "metadata": {"type": JSON, "nullable": True},
+    "input": {"type": String, "nullable": True},
+    "created_at": {"type": BigInteger, "nullable": True},
+    "updated_at": {"type": BigInteger, "nullable": True},
+    "agent_id": {"type": String, "nullable": True},
+    "team_id": {"type": String, "nullable": True},
+}
+
+VERSIONS_TABLE_SCHEMA = {
+    "table_name": {"type": String, "nullable": False, "primary_key": True},
+    "version": {"type": String, "nullable": False},
+    "created_at": {"type": String, "nullable": False, "index": True},
+    "updated_at": {"type": String, "nullable": True},
+}
+
 
 def get_table_schema_definition(table_type: str) -> dict[str, Any]:
     """
@@ -110,6 +132,8 @@ def get_table_schema_definition(table_type: str) -> dict[str, Any]:
         "metrics": METRICS_TABLE_SCHEMA,
         "memories": USER_MEMORY_TABLE_SCHEMA,
         "knowledge": KNOWLEDGE_TABLE_SCHEMA,
+        "culture": CULTURAL_KNOWLEDGE_TABLE_SCHEMA,
+        "versions": VERSIONS_TABLE_SCHEMA,
     }
     schema = schemas.get(table_type, {})
 

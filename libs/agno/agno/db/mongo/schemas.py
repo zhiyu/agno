@@ -19,6 +19,9 @@ MEMORY_COLLECTION_SCHEMA = [
     {"key": "agent_id"},
     {"key": "team_id"},
     {"key": "topics"},
+    {"key": "input"},
+    {"key": "feedback"},
+    {"key": "created_at"},
     {"key": "updated_at"},
 ]
 
@@ -59,6 +62,15 @@ METRICS_COLLECTION_SCHEMA = [
     {"key": [("date", 1), ("aggregation_period", 1)], "unique": True},
 ]
 
+CULTURAL_KNOWLEDGE_COLLECTION_SCHEMA = [
+    {"key": "id", "unique": True},
+    {"key": "name"},
+    {"key": "agent_id"},
+    {"key": "team_id"},
+    {"key": "created_at"},
+    {"key": "updated_at"},
+]
+
 
 def get_collection_indexes(collection_type: str) -> List[Dict[str, Any]]:
     """Get the index definitions for a specific collection type."""
@@ -68,6 +80,7 @@ def get_collection_indexes(collection_type: str) -> List[Dict[str, Any]]:
         "metrics": METRICS_COLLECTION_SCHEMA,
         "evals": EVAL_COLLECTION_SCHEMA,
         "knowledge": KNOWLEDGE_COLLECTION_SCHEMA,
+        "culture": CULTURAL_KNOWLEDGE_COLLECTION_SCHEMA,
     }
 
     indexes = index_definitions.get(collection_type)
